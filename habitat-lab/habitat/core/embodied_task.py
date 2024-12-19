@@ -293,14 +293,16 @@ class EmbodiedTask:
 
     def reset(self, episode: Episode):
         observations = self._sim.reset()
-        observations.update(
-            self.sensor_suite.get_observations(
-                observations=observations,
-                episode=episode,
-                task=self,
-                should_time=True,
+        for agent_id in observations.keys():
+            observations[agent_id].update(
+                self.sensor_suite.get_observations(
+                    agent_id=agent_id,
+                    observations=observations[agent_id],
+                    episode=episode,
+                    task=self,
+                    should_time=True,
+                )
             )
-        )
 
         for action_instance in self.actions.values():
             action_instance.reset(episode=episode, task=self)
@@ -327,36 +329,32 @@ class EmbodiedTask:
         )
 
     def step(self, action: Dict[str, Any], episode: Episode):
-        action_name = action["action"]
-        if "action_args" not in action or action["action_args"] is None:
-            action["action_args"] = {}
-        observations: Optional[Any] = None
-        if isinstance(action_name, tuple):  # there are multiple actions
-            for a_name in action_name:
-                observations = self._step_single_action(
-                    a_name,
-                    action,
-                    episode,
+        agent_actions = {}
+        for agent_id in action.keys():
+            action_name = action[agent_id]["action"]
+            if (
+                "action_args" not in action[agent_id]
+                or action[agent_id]["action_args"] is None
+            ):
+                action[agent_id]["action_args"] = {}
+
+            agent_actions[agent_id] = self._step_single_action(
+                action_name, action[agent_id], episode
+            )
+
+        observations = self._sim.step(agent_actions)
+
+        for agent_id in observations.keys():
+            observations[agent_id].update(
+                self.sensor_suite.get_observations(
+                    agent_id=agent_id,
+                    observations=observations[agent_id],
+                    episode=episode,
+                    action=action,
+                    task=self,
+                    should_time=True,
                 )
-        else:
-            observations = self._step_single_action(
-                action_name, action, episode
             )
-
-        self._sim.step_physics(1.0 / self._physics_target_sps)  # type:ignore
-
-        if observations is None:
-            observations = self._sim.step(None)
-
-        observations.update(
-            self.sensor_suite.get_observations(
-                observations=observations,
-                episode=episode,
-                action=action,
-                task=self,
-                should_time=True,
-            )
-        )
         self._is_episode_active = self._check_episode_is_active(
             observations=observations, action=action, episode=episode
         )

@@ -24,7 +24,6 @@ from gym.spaces.box import Box
 from omegaconf import DictConfig
 
 import habitat_sim
-from habitat.config.default import get_agent_config
 from habitat.core.batch_rendering.env_batch_renderer_constants import (
     KEYFRAME_OBSERVATION_KEY,
     KEYFRAME_SENSOR_PREFIX,
@@ -278,18 +277,21 @@ class HabitatSim(habitat_sim.Simulator, Simulator):
     def __init__(self, config: DictConfig) -> None:
         self.habitat_config = config
 
-        sim_sensors = []
-        for agent_config in self.habitat_config.agents.values():
-            for sensor_cfg in agent_config.sim_sensors.values():
+        self._sensor_suites = []
+        for agent_name in self.habitat_config.agents_order:
+            sim_sensors = []
+            for sensor_cfg in self.habitat_config.agents[
+                agent_name
+            ].sim_sensors.values():
                 sensor_type = registry.get_sensor(sensor_cfg.type)
 
                 assert (
                     sensor_type is not None
                 ), "invalid sensor type {}".format(sensor_cfg.type)
                 sim_sensors.append(sensor_type(sensor_cfg))
+            self._sensor_suites.append(SensorSuite(sim_sensors))
 
-        self._sensor_suite = SensorSuite(sim_sensors)
-        self.sim_config = self.create_sim_config(self._sensor_suite)
+        self.sim_config = self.create_sim_config(self._sensor_suites)
         self._current_scene = self.sim_config.sim_cfg.scene_id
         super().__init__(self.sim_config)
         # load additional object paths specified by the dataset
@@ -304,10 +306,10 @@ class HabitatSim(habitat_sim.Simulator, Simulator):
                 ].action_space
             )
         )
-        self._prev_sim_obs: Optional[Observations] = None
+        self._prev_sim_obs: Optional[Dict[int, Observations]] = None
 
     def create_sim_config(
-        self, _sensor_suite: SensorSuite
+        self, _sensor_suites: List[SensorSuite]
     ) -> habitat_sim.Configuration:
         sim_config = habitat_sim.SimulatorConfiguration()
         # Check if Habitat-Sim is post Scene Config Update
@@ -325,116 +327,126 @@ class HabitatSim(habitat_sim.Simulator, Simulator):
             self.habitat_config.scene_dataset
         )
         sim_config.scene_id = self.habitat_config.scene
-        lab_agent_config = get_agent_config(self.habitat_config)
-        agent_config = habitat_sim.AgentConfiguration()
-        overwrite_config(
-            config_from=lab_agent_config,
-            config_to=agent_config,
-            # These keys are only used by Hab-Lab
-            ignore_keys={
-                "is_set_start_state",
-                # This is the Sensor Config. Unpacked below
-                "sensors",
-                "sim_sensors",
-                "start_position",
-                "start_rotation",
-                "articulated_agent_urdf",
-                "articulated_agent_type",
-                "joint_start_noise",
-                "joint_that_can_control",
-                "motion_data_path",
-                "ik_arm_urdf",
-                "grasp_managers",
-                "max_climb",
-                "max_slope",
-                "joint_start_override",
-                "auto_update_sensor_transform",
-            },
-        )
 
-        # configure default navmesh parameters to match the configured agent
-        if self.habitat_config.default_agent_navmesh:
-            sim_config.navmesh_settings = habitat_sim.nav.NavMeshSettings()
-            sim_config.navmesh_settings.set_defaults()
-            sim_config.navmesh_settings.agent_radius = agent_config.radius
-            sim_config.navmesh_settings.agent_height = agent_config.height
-            sim_config.navmesh_settings.agent_max_climb = (
-                lab_agent_config.max_climb
-            )
-            sim_config.navmesh_settings.agent_max_slope = (
-                lab_agent_config.max_slope
-            )
-            sim_config.navmesh_settings.include_static_objects = (
-                self.habitat_config.navmesh_include_static_objects
-            )
-
-        sensor_specifications = []
-        for sensor in _sensor_suite.sensors.values():
-            assert isinstance(sensor, HabitatSimSensor)
-            sim_sensor_cfg = sensor._get_default_spec()  # type: ignore[operator]
+        agent_configs = []
+        for agent_id, agent_name in enumerate(
+            self.habitat_config.agents_order
+        ):
+            lab_agent_config = self.habitat_config.agents[agent_name]
+            agent_config = habitat_sim.AgentConfiguration()
             overwrite_config(
-                config_from=sensor.config,
-                config_to=sim_sensor_cfg,
+                config_from=lab_agent_config,
+                config_to=agent_config,
                 # These keys are only used by Hab-Lab
-                # or translated into the sensor config manually
-                ignore_keys=sensor._config_ignore_keys,
-                # TODO consider making trans_dict a sensor class var too.
-                trans_dict={
-                    "sensor_model_type": lambda v: getattr(
-                        habitat_sim.FisheyeSensorModelType, v
-                    ),
-                    "sensor_subtype": lambda v: getattr(
-                        habitat_sim.SensorSubType, v
-                    ),
+                ignore_keys={
+                    "is_set_start_state",
+                    # This is the Sensor Config. Unpacked below
+                    "sensors",
+                    "sim_sensors",
+                    "start_position",
+                    "start_rotation",
+                    "articulated_agent_urdf",
+                    "articulated_agent_type",
+                    "joint_start_noise",
+                    "joint_that_can_control",
+                    "motion_data_path",
+                    "ik_arm_urdf",
+                    "grasp_managers",
+                    "max_climb",
+                    "max_slope",
+                    "joint_start_override",
+                    "auto_update_sensor_transform",
                 },
             )
-            sim_sensor_cfg.uuid = sensor.uuid
-            sim_sensor_cfg.resolution = list(
-                sensor.observation_space.shape[:2]
-            )
 
-            # TODO(maksymets): Add configure method to Sensor API to avoid
-            # accessing child attributes through parent interface
-            # We know that the Sensor has to be one of these Sensors
-            sim_sensor_cfg.sensor_type = sensor.sim_sensor_type
-            sim_sensor_cfg.gpu2gpu_transfer = (
-                self.habitat_config.habitat_sim_v0.gpu_gpu
-            )
-            sensor_specifications.append(sim_sensor_cfg)
+            # configure default navmesh parameters to match the configured agent
+            if (
+                self.habitat_config.default_agent_navmesh
+                and agent_id == self.habitat_config.default_agent_id
+            ):
+                sim_config.navmesh_settings = habitat_sim.nav.NavMeshSettings()
+                sim_config.navmesh_settings.set_defaults()
+                sim_config.navmesh_settings.agent_radius = agent_config.radius
+                sim_config.navmesh_settings.agent_height = agent_config.height
+                sim_config.navmesh_settings.agent_max_climb = (
+                    lab_agent_config.max_climb
+                )
+                sim_config.navmesh_settings.agent_max_slope = (
+                    lab_agent_config.max_slope
+                )
+                sim_config.navmesh_settings.include_static_objects = (
+                    self.habitat_config.navmesh_include_static_objects
+                )
 
-        agent_config.sensor_specifications = sensor_specifications
+            sensor_specifications = []
+            for sensor in _sensor_suites[agent_id].sensors.values():
+                assert isinstance(sensor, HabitatSimSensor)
+                sim_sensor_cfg = sensor._get_default_spec()  # type: ignore[operator]
+                overwrite_config(
+                    config_from=sensor.config,
+                    config_to=sim_sensor_cfg,
+                    # These keys are only used by Hab-Lab
+                    # or translated into the sensor config manually
+                    ignore_keys=sensor._config_ignore_keys,
+                    # TODO consider making trans_dict a sensor class var too.
+                    trans_dict={
+                        "sensor_model_type": lambda v: getattr(
+                            habitat_sim.FisheyeSensorModelType, v
+                        ),
+                        "sensor_subtype": lambda v: getattr(
+                            habitat_sim.SensorSubType, v
+                        ),
+                    },
+                )
+                sim_sensor_cfg.uuid = sensor.uuid
+                sim_sensor_cfg.resolution = list(
+                    sensor.observation_space.shape[:2]
+                )
 
-        agent_config.action_space = {
-            0: habitat_sim.ActionSpec("stop"),
-            1: habitat_sim.ActionSpec(
-                "move_forward",
-                habitat_sim.ActuationSpec(
-                    amount=self.habitat_config.forward_step_size
+                # TODO(maksymets): Add configure method to Sensor API to avoid
+                # accessing child attributes through parent interface
+                # We know that the Sensor has to be one of these Sensors
+                sim_sensor_cfg.sensor_type = sensor.sim_sensor_type
+                sim_sensor_cfg.gpu2gpu_transfer = (
+                    self.habitat_config.habitat_sim_v0.gpu_gpu
+                )
+                sensor_specifications.append(sim_sensor_cfg)
+
+            agent_config.sensor_specifications = sensor_specifications
+
+            agent_config.action_space = {
+                0: habitat_sim.ActionSpec("stop"),
+                1: habitat_sim.ActionSpec(
+                    "move_forward",
+                    habitat_sim.ActuationSpec(
+                        amount=self.habitat_config.forward_step_size
+                    ),
                 ),
-            ),
-            2: habitat_sim.ActionSpec(
-                "turn_left",
-                habitat_sim.ActuationSpec(
-                    amount=self.habitat_config.turn_angle
+                2: habitat_sim.ActionSpec(
+                    "turn_left",
+                    habitat_sim.ActuationSpec(
+                        amount=self.habitat_config.turn_angle
+                    ),
                 ),
-            ),
-            3: habitat_sim.ActionSpec(
-                "turn_right",
-                habitat_sim.ActuationSpec(
-                    amount=self.habitat_config.turn_angle
+                3: habitat_sim.ActionSpec(
+                    "turn_right",
+                    habitat_sim.ActuationSpec(
+                        amount=self.habitat_config.turn_angle
+                    ),
                 ),
-            ),
-        }
+            }
 
-        output = habitat_sim.Configuration(sim_config, [agent_config])
+            agent_configs.append(agent_config)
+
+        output = habitat_sim.Configuration(sim_config, agent_configs)
         output.enable_batch_renderer = (
             self.habitat_config.renderer.enable_batch_renderer
         )
         return output
 
     @property
-    def sensor_suite(self) -> SensorSuite:
-        return self._sensor_suite
+    def sensor_suites(self) -> List[SensorSuite]:
+        return self._sensor_suites
 
     @property
     def action_space(self) -> Space:
@@ -456,31 +468,47 @@ class HabitatSim(habitat_sim.Simulator, Simulator):
 
         return is_updated
 
-    def reset(self) -> Observations:
-        sim_obs = super().reset()
+    def reset(self) -> Dict[int, Observations]:
+        sim_obs = super().reset(range(len(self.agents)))  # type: ignore
         if self._update_agents_state():
-            sim_obs = self.get_sensor_observations()
+            sim_obs = self.get_sensor_observations(range(len(self.agents)))
 
         self._prev_sim_obs = sim_obs
         if self.config.enable_batch_renderer:
             self.add_keyframe_to_observations(sim_obs)
             return sim_obs
         else:
-            return self._sensor_suite.get_observations(sim_obs)
+            return {
+                i: self._sensor_suites[i].get_observations(sim_obs[i])
+                for i in sim_obs.keys()
+            }
 
     def step(
-        self, action: Optional[Union[str, np.ndarray, int]]
-    ) -> Observations:
-        if action is None:
-            sim_obs = self.get_sensor_observations()
-        else:
-            sim_obs = super().step(action)
+        self,
+        action: Union[
+            str, int, np.ndarray, Dict[int, Union[str, int, np.ndarray]]
+        ],
+    ) -> Dict[int, Observations]:
+        if not isinstance(action, Dict):
+            action = {self._default_agent_id: action}
+        sim_obs = super().step(
+            {k: v for k, v in action.items() if v is not None}
+        )
+        sim_obs.update(
+            self.get_sensor_observations(
+                [k for k, v in action.items() if v is None]
+            )
+        )
+
         self._prev_sim_obs = sim_obs
         if self.config.enable_batch_renderer:
             self.add_keyframe_to_observations(sim_obs)
             return sim_obs
         else:
-            return self._sensor_suite.get_observations(sim_obs)
+            return {
+                i: self._sensor_suites[i].get_observations(sim_obs[i])
+                for i in sim_obs.keys()
+            }
 
     def render(self, mode: str = "rgb") -> Any:
         r"""
@@ -494,7 +522,7 @@ class HabitatSim(habitat_sim.Simulator, Simulator):
         assert not self.config.enable_batch_renderer
 
         sim_obs = self.get_sensor_observations()
-        observations = self._sensor_suite.get_observations(sim_obs)
+        observations = self._sensor_suites[0].get_observations(sim_obs)
 
         output = observations.get(mode)
         assert output is not None, "mode {} sensor is not active".format(mode)
@@ -514,7 +542,7 @@ class HabitatSim(habitat_sim.Simulator, Simulator):
         # TODO(maksymets): Switch to Habitat-Sim more efficient caching
         is_same_scene = habitat_config.scene == self._current_scene
         self.habitat_config = habitat_config
-        self.sim_config = self.create_sim_config(self._sensor_suite)
+        self.sim_config = self.create_sim_config(self._sensor_suites)
         if not is_same_scene:
             self._current_scene = habitat_config.scene
             if should_close_on_new_scene:
@@ -685,7 +713,7 @@ class HabitatSim(habitat_sim.Simulator, Simulator):
 
             self._prev_sim_obs = sim_obs
 
-            observations = self._sensor_suite.get_observations(sim_obs)
+            observations = self._sensor_suites[0].get_observations(sim_obs)
             if not keep_agent_at_new_pose:
                 self.set_agent_state(
                     current_state.position,
@@ -719,7 +747,10 @@ class HabitatSim(habitat_sim.Simulator, Simulator):
             will _always_ be false after :meth:`reset` or :meth:`get_observations_at` as neither of those
             result in an action (step) being taken.
         """
-        return self._prev_sim_obs.get("collided", False)
+        return {
+            i: self._prev_sim_obs[i].get("collided", False)
+            for i in self._prev_sim_obs.keys()
+        }
 
     def add_keyframe_to_observations(self, observations):
         r"""Adds an item to observations that contains the latest gfx-replay keyframe.
@@ -729,16 +760,17 @@ class HabitatSim(habitat_sim.Simulator, Simulator):
         """
         assert self.config.enable_batch_renderer
 
-        assert KEYFRAME_OBSERVATION_KEY not in observations
-        for _sensor_uuid, sensor in self._sensors.items():
-            node = sensor._sensor_object.node
-            transform = node.absolute_transformation()
-            rotation = mn.Quaternion.from_matrix(transform.rotation())
-            self.gfx_replay_manager.add_user_transform_to_keyframe(
-                KEYFRAME_SENSOR_PREFIX + _sensor_uuid,
-                transform.translation,
-                rotation,
-            )
-        observations[
-            KEYFRAME_OBSERVATION_KEY
-        ] = self.gfx_replay_manager.extract_keyframe()
+        for agent_id in range(len(self.agents)):
+            assert KEYFRAME_OBSERVATION_KEY not in observations[agent_id]
+            for _sensor_uuid, sensor in self.__sensors[agent_id].items():
+                node = sensor._sensor_object.node
+                transform = node.absolute_transformation()
+                rotation = mn.Quaternion.from_matrix(transform.rotation())
+                self.gfx_replay_manager.add_user_transform_to_keyframe(
+                    KEYFRAME_SENSOR_PREFIX + _sensor_uuid,
+                    transform.translation,
+                    rotation,
+                )
+            observations[agent_id][
+                KEYFRAME_OBSERVATION_KEY
+            ] = self.gfx_replay_manager.extract_keyframe()

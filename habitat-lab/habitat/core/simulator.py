@@ -286,21 +286,21 @@ class Simulator:
         pass
 
     @property
-    def sensor_suite(self) -> SensorSuite:
+    def sensor_suites(self) -> List[SensorSuite]:
         raise NotImplementedError
 
     @property
     def action_space(self) -> Space:
         raise NotImplementedError
 
-    def reset(self) -> Observations:
+    def reset(self) -> Dict[int, Observations]:
         """resets the simulator and returns the initial observations.
 
         :return: initial observations from simulator.
         """
         raise NotImplementedError
 
-    def step(self, action, *args, **kwargs) -> Observations:
+    def step(self, action, *args, **kwargs) -> Dict[int, Observations]:
         """Perform an action in the simulator and return observations.
 
         :param action: action to be performed inside the simulator.

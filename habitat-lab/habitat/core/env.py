@@ -123,7 +123,7 @@ class Env:
         )
         self.observation_space = spaces.Dict(
             {
-                **self._sim.sensor_suite.observation_spaces.spaces,
+                **self._sim.sensor_suites[0].observation_spaces.spaces,
                 **self._task.sensor_suite.observation_spaces.spaces,
             }
         )
@@ -233,7 +233,7 @@ class Env:
         self._elapsed_steps = 0
         self._episode_over = False
 
-    def reset(self) -> Observations:
+    def reset(self) -> Dict[int, Observations]:
         r"""Resets the environments and returns the initial observations.
 
         :return: initial observations from the environment.
@@ -281,8 +281,8 @@ class Env:
             self.episode_iterator.step_taken()
 
     def step(
-        self, action: Union[int, str, Dict[str, Any]], **kwargs
-    ) -> Observations:
+        self, action: Union[int, str, Dict], **kwargs
+    ) -> Dict[int, Observations]:
         r"""Perform an action in the environment and return observations.
 
         :param action: action (belonging to :ref:`action_space`) to be
@@ -305,7 +305,11 @@ class Env:
 
         # Support simpler interface as well
         if isinstance(action, (str, int, np.integer)):
-            action = {"action": action}
+            action = {0: action}
+
+        for agent_id in action.keys():
+            if isinstance(action[agent_id], (str, int, np.integer)):
+                action[agent_id] = {"action": action[agent_id]}
 
         observations = self.task.step(
             action=action, episode=self.current_episode
