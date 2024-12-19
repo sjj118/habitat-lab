@@ -134,7 +134,7 @@ if __name__ == "__main__":
 
     # %%
     action = None
-    obs = env.reset()
+    obs = env.reset()[0]
     valid_actions = ["turn_left", "turn_right", "move_forward", "stop"]
     interactive_control = False  # @param {type:"boolean"}
     while action != "stop":
@@ -164,7 +164,7 @@ if __name__ == "__main__":
             {
                 "action": action,
             }
-        )
+        )[0]
 
     env.close()
 
@@ -310,7 +310,7 @@ if __name__ == "__main__":
                 "action": action,
                 "action_args": None,
             }
-        )
+        )[0]
         print("Episode over:", env.episode_over)
 
     env.close()
@@ -380,7 +380,7 @@ if __name__ == "__main__":
     env = habitat.Env(config=config)
 
     # %%
-    obs = env.reset()
+    obs = env.reset()[0]
 
     # %%
     obs.keys()

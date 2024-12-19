@@ -428,9 +428,9 @@ class RLEnv(gym.Env):
     ) -> Union[Observations, Tuple[Observations, Dict]]:
         observations = self._env.reset()
         if return_info:
-            return observations, self.get_info(observations)
+            return observations[0], self.get_info(observations[0])
         else:
-            return observations
+            return observations[0]
 
     def get_reward_range(self):
         r"""Get min, max range of reward.
@@ -475,7 +475,7 @@ class RLEnv(gym.Env):
         :return: :py:`(observations, reward, done, info)`
         """
 
-        observations = self._env.step(*args, **kwargs)
+        observations = self._env.step(*args, **kwargs)[0]
         reward = self.get_reward(observations)
         done = self.get_done(observations)
         info = self.get_info(observations)

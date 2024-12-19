@@ -153,7 +153,7 @@ class Benchmark:
             agent.reset()
 
             while not self._env.episode_over:
-                action = agent.act(observations)
+                action = agent.act(observations[0])
                 observations = self._env.step(action)
 
             metrics = self._env.get_metrics()
