@@ -398,7 +398,14 @@ class EpisodicCompassSensor(HeadingSensor):
     ):
         agent_state = self._sim.get_agent_state(agent_id)
         rotation_world_agent = agent_state.rotation
-        rotation_world_start = quaternion_from_coeff(episode.start_rotation)
+        if isinstance(episode.start_rotation[0], List):  # type: ignore
+            rotation_world_start = quaternion_from_coeff(
+                np.array(episode.start_rotation).mean(axis=0).tolist()
+            )
+        else:
+            rotation_world_start = quaternion_from_coeff(
+                episode.start_rotation
+            )
 
         if isinstance(rotation_world_agent, quaternion.quaternion):
             return self._quat_to_xy_heading(
@@ -451,8 +458,16 @@ class EpisodicGPSSensor(Sensor):
     ):
         agent_state = self._sim.get_agent_state(agent_id)
 
-        origin = np.array(episode.start_position, dtype=np.float32)
-        rotation_world_start = quaternion_from_coeff(episode.start_rotation)
+        if isinstance(episode.start_rotation[0], List):  # type: ignore
+            origin = np.array(episode.start_position, dtype=np.float32).mean(axis=0)
+            rotation_world_start = quaternion_from_coeff(
+                np.array(episode.start_rotation).mean(axis=0).tolist()
+            )
+        else:
+            origin = np.array(episode.start_position, dtype=np.float32)
+            rotation_world_start = quaternion_from_coeff(
+                episode.start_rotation
+            )
 
         agent_position = agent_state.position
 
@@ -894,9 +909,13 @@ class TopDownMap(Measure):
             self._draw_shortest_path(episode, agent_position)
 
         if self._config.draw_source:
-            self._draw_point(
-                episode.start_position, maps.MAP_SOURCE_POINT_INDICATOR
-            )
+            if isinstance(episode.start_position[0], List):  # type: ignore
+                for position in episode.start_position:
+                    self._draw_point(position, maps.MAP_SOURCE_POINT_INDICATOR)
+            else:
+                self._draw_point(
+                    episode.start_position, maps.MAP_SOURCE_POINT_INDICATOR
+                )
 
         self.update_metric(episode, None)
         self._step_count = 0
