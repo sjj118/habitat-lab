@@ -69,6 +69,23 @@ if TYPE_CHECKING:
 MAP_THICKNESS_SCALAR: int = 128
 
 
+def _is_stop_action(action: Any, task: Optional["NavigationTask"]) -> bool:
+    if action is None or task is None or not isinstance(action, dict):
+        return False
+
+    for action_value in action.values():
+        if not isinstance(action_value, dict) or "action" not in action_value:
+            continue
+        action_name = action_value["action"]
+        if isinstance(action_name, (int, np.integer)):
+            action_name = task.get_action_name(int(action_name))
+
+        if action_name == "stop":
+            return True
+
+    return False
+
+
 @attr.s(auto_attribs=True, kw_only=True)
 class NavigationGoal:
     r"""Base class for a goal specification hierarchy."""
@@ -554,47 +571,36 @@ class Success(Measure):
         task.measurements.check_measure_dependencies(
             self.uuid, [DistanceToGoal.cls_uuid]
         )
+        self._metric = [False] * len(episode.goals)
         self.update_metric(episode=episode, task=task, *args, **kwargs)  # type: ignore
 
     def update_metric(
         self, episode, task: EmbodiedTask, *args: Any, **kwargs: Any
     ):
-        distance_to_target = task.measurements.measures[
-            DistanceToGoal.cls_uuid
-        ].get_metric()
-
-        self._metric = {
-            agent_id: float(
-                getattr(task, "is_stop_called", False)
-                and distance_to_target[agent_id] < self._success_distance
-            )
-            for agent_id in distance_to_target.keys()
-        }
+        if hasattr(task, "_completed_goals"):
+            self._metric = task._completed_goals
 
 
 @registry.register_measure
 class SPL(Measure):
     r"""SPL (Success weighted by Path Length)
-
     ref: On Evaluation of Embodied Agents - Anderson et. al
     https://arxiv.org/pdf/1807.06757.pdf
-    The measure depends on Distance to Goal measure and Success measure
-    to improve computational
-    performance for sophisticated goal areas.
+
+    This implementation has been modified to be a **per-goal average SPL** for
+    multi-goal tasks. For each goal, SPL is computed as S * (L / max(L, P)),
+    and the final metric is the average of these values over all goals.
+    - S = 1 if the goal is completed, 0 otherwise.
+    - L = The geodesic distance from the closest agent's start position to the goal.
+    - P = The actual path length of the agent that completed the goal.
     """
 
     def __init__(
         self, sim: Simulator, config: "DictConfig", *args: Any, **kwargs: Any
     ):
-        self._previous_position: Dict[int, Union[np.ndarray, List[float]]] = {}
-        self._start_end_episode_distance: Optional[float] = None
-        self._agent_episode_distance: Dict[int, float] = {}
-        self._episode_view_points: Optional[
-            List[Tuple[float, float, float]]
-        ] = None
         self._sim = sim
         self._config = config
-
+        self._optimal_path_lengths: List[float] = []
         super().__init__()
 
     def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
@@ -602,47 +608,29 @@ class SPL(Measure):
 
     def reset_metric(self, episode, task, *args: Any, **kwargs: Any):
         task.measurements.check_measure_dependencies(
-            self.uuid, [DistanceToGoal.cls_uuid, Success.cls_uuid]
+            self.uuid, [DistanceToGoal.cls_uuid]
         )
-        self._metric = {}
-        self._previous_position = {}
-        self._agent_episode_distance = {}
-        for agent_id in range(len(self._sim.habitat_config.agents)):
-            self._previous_position[agent_id] = self._sim.get_agent_state(
-                agent_id
-            ).position
-            self._agent_episode_distance[agent_id] = 0.0
+        self._metric = [0.0] * len(episode.goals)
+        self._optimal_path_lengths = []
 
-        self._start_end_episode_distance = min(
-            task.measurements.measures[DistanceToGoal.cls_uuid]
-            .get_metric()
-            .values()
-        )
-        self.update_metric(episode=episode, task=task, *args, **kwargs)  # type: ignore
+        distance_to_goal = task.measurements.measures[
+            DistanceToGoal.cls_uuid
+        ].get_current_distance()
 
-    def _euclidean_distance(self, position_a, position_b):
-        return np.linalg.norm(position_b - position_a, ord=2)
+        for goal_idx in range(len(episode.goals)):
+            self._optimal_path_lengths.append(min(distance_to_goal[goal_idx].values()))
+
+        self.update_metric(episode=episode, task=task, *args, **kwargs)
 
     def update_metric(
-        self, episode, task: EmbodiedTask, *args: Any, **kwargs: Any
+        self, episode, task: "NavigationTask", *args: Any, **kwargs: Any
     ):
-        ep_success = task.measurements.measures[Success.cls_uuid].get_metric()
 
-        for agent_id in ep_success.keys():
-            current_position = self._sim.get_agent_state(agent_id).position
-            self._agent_episode_distance[agent_id] += self._euclidean_distance(
-                current_position, self._previous_position[agent_id]
-            )
+        for goal_idx, goal in enumerate(episode.goals):
+            optimal_path_len = self._optimal_path_lengths[goal_idx]
+            path_len = task._goal_completion_path_lengths[goal_idx]
 
-            self._previous_position[agent_id] = current_position
-
-            self._metric[agent_id] = ep_success[agent_id] * (
-                self._start_end_episode_distance
-                / max(
-                    self._start_end_episode_distance,
-                    self._agent_episode_distance[agent_id],
-                )
-            )
+            self._metric[goal_idx] = optimal_path_len / max(path_len, optimal_path_len)
 
 
 @registry.register_measure
@@ -660,47 +648,48 @@ class SoftSPL(SPL):
         task.measurements.check_measure_dependencies(
             self.uuid, [DistanceToGoal.cls_uuid]
         )
-        self._metric = {}
+        self._metric = [0.0] * len(episode.goals)
+        self._optimal_path_lengths = []
 
-        self._previous_position = {}
-        self._agent_episode_distance = {}
-        for agent_id in range(len(self._sim.habitat_config.agents)):
-            self._previous_position[agent_id] = self._sim.get_agent_state(
-                agent_id
-            ).position
-            self._agent_episode_distance[agent_id] = 0.0
-
-        self._start_end_episode_distance = min(
-            task.measurements.measures[DistanceToGoal.cls_uuid]
-            .get_metric()
-            .values()
-        )
-        self.update_metric(episode=episode, task=task, *args, **kwargs)  # type: ignore
-
-    def update_metric(self, episode, task, *args: Any, **kwargs: Any):
-        distance_to_target = task.measurements.measures[
+        distance_to_goal = task.measurements.measures[
             DistanceToGoal.cls_uuid
-        ].get_metric()
+        ].get_current_distance()
 
-        for i in distance_to_target.keys():
-            current_position = self._sim.get_agent_state(i).position
-            ep_soft_success = max(
-                0, 1 - distance_to_target[i] / self._start_end_episode_distance
-            )
+        for goal_idx in range(len(episode.goals)):
+            self._optimal_path_lengths.append(min(distance_to_goal[goal_idx].values()))
 
-            self._agent_episode_distance[i] += self._euclidean_distance(
-                current_position, self._previous_position[i]
-            )
+        self._current_softspl: List[float] = [0.0] * len(episode.goals)
+        self._best_softspl: List[float] = [0.0] * len(episode.goals)
 
-            self._previous_position[i] = current_position
+        self.update_metric(episode=episode, task=task, *args, **kwargs)
 
-            self._metric[i] = ep_soft_success * (
-                self._start_end_episode_distance
-                / max(
-                    self._start_end_episode_distance,
-                    self._agent_episode_distance[i],
-                )
-            )
+    def update_metric(self, episode, task: "NavigationTask", action = None, *args: Any, **kwargs: Any):
+        distance_to_goal = task.measurements.measures[
+            DistanceToGoal.cls_uuid
+        ].get_current_distance()
+
+        for goal_idx in range(len(episode.goals)):
+            optimal_path_len = self._optimal_path_lengths[goal_idx]
+            best_value = 0.0
+
+            for agent_id, dist in distance_to_goal[goal_idx].items():
+                path_len = task._agent_path_lengths[agent_id]
+
+                soft_success = max(0.0, 1.0 - dist / optimal_path_len)
+
+                current_value = soft_success * (optimal_path_len / max(optimal_path_len, path_len))
+
+                if current_value > best_value:
+                    best_value = current_value
+
+            self._current_softspl[goal_idx] = best_value
+
+        if _is_stop_action(action, task):
+            for goal_idx, current_value in enumerate(self._current_softspl):
+                if current_value > self._best_softspl[goal_idx]:
+                    self._best_softspl[goal_idx] = current_value
+
+        self._metric = [max(current, best) for current, best in zip(self._current_softspl, self._best_softspl)]
 
 
 @registry.register_measure
@@ -1001,10 +990,10 @@ class DistanceToGoal(Measure):
         self._previous_position: Dict[int, Tuple[float, float, float]] = {}
         self._sim = sim
         self._config = config
-        self._episode_view_points: Optional[
-            List[Tuple[float, float, float]]
-        ] = None
+        self._goal_view_points = None
         self._distance_to = self._config.distance_to
+        self._current_distance: Dict[int, Dict[int, float]] = {}
+        self._best_distance: Dict[int, Dict[int, float]] = {}
 
         super().__init__(**kwargs)
 
@@ -1012,18 +1001,28 @@ class DistanceToGoal(Measure):
         return self.cls_uuid
 
     def reset_metric(self, episode, *args: Any, **kwargs: Any):
-        self._metric = {}
+        num_goals = len(episode.goals)
+        self._metric = {goal_idx: {} for goal_idx in range(num_goals)}
+        self._current_distance = {goal_idx: {} for goal_idx in range(num_goals)}
+        self._best_distance = {goal_idx: {} for goal_idx in range(num_goals)}
         self._previous_position = {}
         if self._distance_to == "VIEW_POINTS":
-            self._episode_view_points = [
-                view_point.agent_state.position
+            self._goal_view_points = [
+                [view_point.agent_state.position for view_point in goal.view_points]
                 for goal in episode.goals
-                for view_point in goal.view_points
             ]
         self.update_metric(episode=episode, *args, **kwargs)  # type: ignore
 
+    def get_current_distance(self):
+        return self._current_distance
+
     def update_metric(
-        self, episode: NavigationEpisode, *args: Any, **kwargs: Any
+        self,
+        episode: NavigationEpisode,
+        action=None,
+        task: Optional[EmbodiedTask] = None,
+        *args: Any,
+        **kwargs: Any,
     ):
         for agent_id in range(len(self._sim.habitat_config.agents)):
             current_position = self._sim.get_agent_state(agent_id).position
@@ -1034,26 +1033,50 @@ class DistanceToGoal(Measure):
                 self._previous_position[agent_id], current_position, atol=1e-4
             ):
                 if self._distance_to == "POINT":
-                    distance_to_target = self._sim.geodesic_distance(
-                        current_position,
-                        [goal.position for goal in episode.goals],
-                        episode,
-                    )
+                    distance_to_target = [
+                        self._sim.geodesic_distance(
+                            current_position, [goal.position]
+                        )
+                        for goal in episode.goals
+                    ]
                 elif self._distance_to == "VIEW_POINTS":
-                    distance_to_target = self._sim.geodesic_distance(
-                        current_position, self._episode_view_points, episode
-                    )
+                    distance_to_target = [
+                        self._sim.geodesic_distance(
+                            current_position, self._goal_view_points[i]
+                        )
+                        for i in range(len(episode.goals))
+                    ]
                 else:
                     logger.error(
                         f"Non valid distance_to parameter was provided: {self._distance_to }"
                     )
+                    continue
+
+                for goal_idx, distance in enumerate(distance_to_target):
+                    self._current_distance[goal_idx][agent_id] = distance
 
                 self._previous_position[agent_id] = (
                     current_position[0],
                     current_position[1],
                     current_position[2],
                 )
-                self._metric[agent_id] = distance_to_target
+
+        if _is_stop_action(action, task):
+            for goal_idx, distance_by_agent in self._current_distance.items():
+                for agent_id, distance in distance_by_agent.items():
+                    best_distance = self._best_distance[goal_idx].get(agent_id, float("inf"))
+                    if distance < best_distance:
+                        self._best_distance[goal_idx][agent_id] = distance
+
+        metric: Dict[int, Dict[int, float]] = {}
+        for goal_idx in self._current_distance.keys():
+            metric[goal_idx] = {}
+            for agent_id in self._current_distance[goal_idx].keys():
+                current_distance = self._current_distance[goal_idx][agent_id]
+                best_distance = self._best_distance[goal_idx].get(agent_id, float("inf"))
+                metric[goal_idx][agent_id] = min(current_distance, best_distance)
+
+        self._metric = metric
 
 
 @registry.register_measure
@@ -1071,7 +1094,7 @@ class DistanceToGoalReward(Measure):
     ):
         self._sim = sim
         self._config = config
-        self._previous_distance: Dict[int, float] = {}
+        self._previous_distance: Dict[int, Dict[int, float]] = {}
         super().__init__()
 
     def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
@@ -1083,7 +1106,7 @@ class DistanceToGoalReward(Measure):
         )
         self._previous_distance = task.measurements.measures[
             DistanceToGoal.cls_uuid
-        ].get_metric()
+        ].get_current_distance()
         self.update_metric(episode=episode, task=task, *args, **kwargs)  # type: ignore
 
     def update_metric(
@@ -1091,13 +1114,19 @@ class DistanceToGoalReward(Measure):
     ):
         distance_to_target = task.measurements.measures[
             DistanceToGoal.cls_uuid
-        ].get_metric()
+        ].get_current_distance()
         self._metric = {
-            agent_id: self._previous_distance[agent_id]
-            - distance_to_target[agent_id]
-            for agent_id in distance_to_target.keys()
+            goal_idx: {
+                agent_id: self._previous_distance[goal_idx][agent_id]
+                - distance
+                for agent_id, distance in distance_by_agent.items()
+            }
+            for goal_idx, distance_by_agent in distance_to_target.items()
         }
-        self._previous_distance = distance_to_target.copy()
+        self._previous_distance = {
+            goal_idx: distance_by_agent.copy()
+            for goal_idx, distance_by_agent in distance_to_target.items()
+        }
 
 
 class NavigationMovementAgentAction(SimulatorTaskAction):
@@ -1153,13 +1182,33 @@ class StopAction(SimulatorTaskAction):
     name: str = "stop"
 
     def reset(self, task: EmbodiedTask, *args: Any, **kwargs: Any):
-        task.is_stop_called = False  # type: ignore
+        task.is_stop_called = False
 
-    def step(self, task: EmbodiedTask, *args: Any, **kwargs: Any):
+    def step(
+        self, task: "NavigationTask", agent_id: int, *args: Any, **kwargs: Any
+    ):
         r"""Update ``_metric``, this method is called from ``Env`` on each
         ``step``.
         """
-        task.is_stop_called = True  # type: ignore
+        distances_by_goal = task.measurements.measures[
+            DistanceToGoal.cls_uuid
+        ].get_current_distance()
+        success_distance = task.measurements.measures[
+            Success.cls_uuid
+        ]._success_distance
+
+        can_complete_goal = False
+        for i in range(len(task._completed_goals)):
+            if not task._completed_goals[i] and distances_by_goal[i][agent_id] < success_distance:
+                task._completed_goals[i] = True
+                can_complete_goal = True
+
+                path_len = task._agent_path_lengths[agent_id]
+                if path_len < task._goal_completion_path_lengths[i]:
+                    task._goal_completion_path_lengths[i] = path_len
+
+        if not can_complete_goal or all(task._completed_goals):
+            task.is_stop_called = True
 
 
 @registry.register_task_action
@@ -1383,6 +1432,9 @@ class NavigationTask(EmbodiedTask):
         dataset: Optional[Dataset] = None,
     ) -> None:
         super().__init__(config=config, sim=sim, dataset=dataset)
+        self._completed_goals: List[bool] = []
+        self._agent_path_lengths: List[float] = []
+        self._goal_completion_path_lengths: List[float] = []
 
     def overwrite_sim_config(self, config: Any, episode: Episode) -> Any:
         with read_write(config):
@@ -1404,7 +1456,28 @@ class NavigationTask(EmbodiedTask):
                         float(k) for k in episode.start_rotation[agent_id]  # type: ignore
                     ]
                     agent_config.is_set_start_state = True
+        self._completed_goals = [False] * len(episode.goals)
         return config
+
+    def reset(self, episode: Episode):
+        self._agent_path_lengths = [0.0] * len(self._sim.habitat_config.agents)
+        self._goal_completion_path_lengths = [float("inf")] * len(episode.goals)
+        return super().reset(episode)
+
+    def step(self, action: Dict[str, Any], episode: Episode):
+        previous_positions = []
+        for i in range(len(self._sim.habitat_config.agents)):
+            previous_positions.append(self._sim.get_agent_state(i).position.copy())
+
+        obs = super().step(action, episode)
+
+        for i in range(len(self._sim.habitat_config.agents)):
+            current_pos = self._sim.get_agent_state(i).position
+            self._agent_path_lengths[i] += np.linalg.norm(
+                current_pos - previous_positions[i]
+            )
+
+        return obs
 
     def _check_episode_is_active(self, *args: Any, **kwargs: Any) -> bool:
         return not getattr(self, "is_stop_called", False)
