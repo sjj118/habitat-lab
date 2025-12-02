@@ -316,6 +316,7 @@ class EmbodiedTask:
         action_name: Any,
         action: Dict[str, Any],
         episode: Episode,
+        agent_id: int,
     ):
         if isinstance(action_name, (int, np.integer)):
             action_name = self.get_action_name(action_name)
@@ -326,6 +327,7 @@ class EmbodiedTask:
         return task_action.step(
             **action["action_args"],
             task=self,
+            agent_id=agent_id,
         )
 
     def step(self, action: Dict[str, Any], episode: Episode):
@@ -339,7 +341,7 @@ class EmbodiedTask:
                 action[agent_id]["action_args"] = {}
 
             agent_actions[agent_id] = self._step_single_action(
-                action_name, action[agent_id], episode
+                action_name, action[agent_id], episode, agent_id
             )
 
         observations = self._sim.step(agent_actions)
