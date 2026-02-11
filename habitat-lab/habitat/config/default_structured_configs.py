@@ -34,6 +34,7 @@ __all__ = [
     "DistanceToGoalMeasurementConfig",
     "SuccessMeasurementConfig",
     "SPLMeasurementConfig",
+    "SNAMeasurementConfig",
     "SoftSPLMeasurementConfig",
     "DistanceToGoalRewardMeasurementConfig",
     # NAVIGATION LAB SENSORS
@@ -753,6 +754,15 @@ class SPLMeasurementConfig(MeasurementConfig):
     SPL = success * optimal_distance_to_goal / distance_traveled_so_far
     """
     type: str = "SPL"
+
+
+@dataclass
+class SNAMeasurementConfig(MeasurementConfig):
+    r"""
+    For Navigation tasks only, Measures SNA (Success weighted by Number of Actions).
+    SNA = optimal_number_of_actions / max(actual_number_of_actions, optimal_number_of_actions)
+    """
+    type: str = "SNA"
 
 
 @dataclass
@@ -2372,6 +2382,12 @@ cs.store(
     group="habitat/task/measurements",
     name="spl",
     node=SPLMeasurementConfig,
+)
+cs.store(
+    package="habitat.task.measurements.sna",
+    group="habitat/task/measurements",
+    name="sna",
+    node=SNAMeasurementConfig,
 )
 cs.store(
     package="habitat.task.measurements.soft_spl",

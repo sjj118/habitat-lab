@@ -6,6 +6,7 @@
 
 # TODO, lots of typing errors in here
 
+import math
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -634,6 +635,61 @@ class SPL(Measure):
 
 
 @registry.register_measure
+class SNA(Measure):
+    r"""SNA (Success weighted by Number of Actions)
+
+    Per-goal metric for multi-goal tasks:
+    - SNA_i = A*_i / max(A_i, A*_i)
+    - A_i is the action count at goal completion for the completing agent.
+      Unfinished goals keep A_i = inf and therefore SNA_i = 0.
+    - A*_i is approximated from geodesic distance with discrete action counts.
+    """
+
+    cls_uuid: str = "sna"
+
+    def __init__(
+        self, sim: Simulator, config: "DictConfig", *args: Any, **kwargs: Any
+    ):
+        self._sim = sim
+        self._config = config
+        self._optimal_action_counts: List[int] = []
+        super().__init__()
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+
+    def reset_metric(self, episode, task, *args: Any, **kwargs: Any):
+        task.measurements.check_measure_dependencies(
+            self.uuid, [DistanceToGoal.cls_uuid]
+        )
+        self._metric = [0.0] * len(episode.goals)
+        self._optimal_action_counts = []
+
+        distance_to_goal = task.measurements.measures[
+            DistanceToGoal.cls_uuid
+        ].get_current_distance()
+
+        forward_step_size = float(self._sim.habitat_config.forward_step_size)
+
+        for goal_idx in range(len(episode.goals)):
+            optimal_path_len = min(distance_to_goal[goal_idx].values())
+            optimal_actions = int(math.ceil(optimal_path_len / forward_step_size)) + 1
+            self._optimal_action_counts.append(max(1, optimal_actions))
+
+        self.update_metric(episode=episode, task=task, *args, **kwargs)
+
+    def update_metric(
+        self, episode, task: "NavigationTask", *args: Any, **kwargs: Any
+    ):
+        for goal_idx in range(len(episode.goals)):
+            optimal_action_count = float(self._optimal_action_counts[goal_idx])
+            action_count = task._goal_completion_action_counts[goal_idx]
+            self._metric[goal_idx] = optimal_action_count / max(
+                action_count, optimal_action_count
+            )
+
+
+@registry.register_measure
 class SoftSPL(SPL):
     r"""Soft SPL
 
@@ -1207,6 +1263,10 @@ class StopAction(SimulatorTaskAction):
                 if path_len < task._goal_completion_path_lengths[i]:
                     task._goal_completion_path_lengths[i] = path_len
 
+                action_count = task._agent_action_counts[agent_id]
+                if action_count < task._goal_completion_action_counts[i]:
+                    task._goal_completion_action_counts[i] = action_count
+
         if not can_complete_goal or all(task._completed_goals):
             task.is_stop_called = True
 
@@ -1435,6 +1495,8 @@ class NavigationTask(EmbodiedTask):
         self._completed_goals: List[bool] = []
         self._agent_path_lengths: List[float] = []
         self._goal_completion_path_lengths: List[float] = []
+        self._agent_action_counts: List[int] = []
+        self._goal_completion_action_counts: List[float] = []
 
     def overwrite_sim_config(self, config: Any, episode: Episode) -> Any:
         with read_write(config):
@@ -1462,6 +1524,8 @@ class NavigationTask(EmbodiedTask):
     def reset(self, episode: Episode):
         self._agent_path_lengths = [0.0] * len(self._sim.habitat_config.agents)
         self._goal_completion_path_lengths = [float("inf")] * len(episode.goals)
+        self._agent_action_counts = [0] * len(self._sim.habitat_config.agents)
+        self._goal_completion_action_counts = [float("inf")] * len(episode.goals)
         return super().reset(episode)
 
     def step(self, action: Dict[str, Any], episode: Episode):
@@ -1472,6 +1536,7 @@ class NavigationTask(EmbodiedTask):
         obs = super().step(action, episode)
 
         for i in range(len(self._sim.habitat_config.agents)):
+            self._agent_action_counts[i] += 1
             current_pos = self._sim.get_agent_state(i).position
             self._agent_path_lengths[i] += np.linalg.norm(
                 current_pos - previous_positions[i]
